@@ -59,6 +59,7 @@ class ScriptedHooks(NullHooks):
         on_mark_end=None,
         on_sweep_begin=None,
         on_before_reclaim=None,
+        on_before_unlink=None,
         on_after_reclaim=None,
     ) -> None:
         self._cbs = {
@@ -67,6 +68,7 @@ class ScriptedHooks(NullHooks):
             "mark_end": on_mark_end,
             "sweep_begin": on_sweep_begin,
             "before_reclaim": on_before_reclaim,
+            "before_unlink": on_before_unlink,
             "after_reclaim": on_after_reclaim,
         }
         self._lock = threading.Lock()
@@ -78,6 +80,15 @@ class ScriptedHooks(NullHooks):
         cb = self._cbs[name]
         if cb is not None:
             cb(run_id, object_id)
+
+    def _fire3(
+        self, name: str, run_id: str, object_id: str, extra: str
+    ) -> None:
+        with self._lock:
+            self.events.append((name, object_id))
+        cb = self._cbs[name]
+        if cb is not None:
+            cb(run_id, object_id, extra)
 
     def mark_begin(self, run_id: str) -> None:
         self._fire("mark_begin", run_id)
@@ -105,6 +116,9 @@ class ScriptedHooks(NullHooks):
 
     def before_reclaim(self, run_id: str, object_id: str) -> None:
         self._fire("before_reclaim", run_id, object_id)
+
+    def before_unlink(self, run_id: str, object_id: str, blob_name: str) -> None:
+        self._fire3("before_unlink", run_id, object_id, blob_name)
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
         self._fire("after_reclaim", run_id, object_id)

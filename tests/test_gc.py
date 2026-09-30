@@ -175,6 +175,116 @@ def test_concurrent_publish_inside_sweep_window_has_deterministic_outcome(
     assert_consistent(r_main)
 
 
+def test_republish_same_content_inside_unlink_window_keeps_valid_snapshot(
+    repo_root, clock
+):
+    """同内容复活：元数据删除已提交、旧文件未 unlink 的窗口里重新 put 并发布。
+
+    旧实现中 put 会复用/重建同一物理路径，旧回收随后 unlink 掉复活所依赖的
+    文件，留下指向缺失内容的有效快照，且重试旧 run 还会因同 id 重现报一致性
+    错误。物理化身隔离后：复活写新化身文件，旧回收只删它记录的旧化身，
+    新快照始终可读，旧 run 重试幂等，新一轮回收保住被快照引用的对象。
+    """
+
+    r_seed = Repository(repo_root, clock=clock)
+    data = b"reborn-content"
+    oid = r_seed.put(data)
+
+    barrier = threading.Barrier(2)
+    resurrect_done = threading.Event()
+    resurrect_error: list[Exception] = []
+    new_sid: list[str] = []
+
+    def on_before_unlink(run_id, object_id, blob_name):
+        # 元数据删除已提交、即将 unlink 旧化身：放行复活线程并等它完成。
+        barrier.wait(timeout=10)
+        assert resurrect_done.wait(timeout=10)
+
+    hooks = ScriptedHooks(on_before_unlink=on_before_unlink)
+    r_gc = Repository(repo_root, clock=clock, hooks=hooks)
+    mark = r_gc.gc_mark()
+    assert mark.candidate_ids == [oid]
+
+    def resurrect() -> None:
+        barrier.wait(timeout=10)
+        try:
+            cli = Repository(repo_root, clock=clock)
+            revived = cli.put(data)  # 重新写入相同内容
+            sid = cli.publish_snapshot([revived])  # 立即发布引用它的新快照
+            assert cli.get(revived) == data
+            new_sid.append(sid)
+        except Exception as exc:  # noqa: BLE001 - 任何错误都使测试失败
+            resurrect_error.append(exc)
+        finally:
+            resurrect_done.set()
+
+    t = threading.Thread(target=resurrect)
+    t.start()
+
+    result = r_gc.gc_sweep(mark.run_id)  # 旧回收随后补删旧化身
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert resurrect_error == []
+    assert result.reclaimed == [oid]
+
+    r = Repository(repo_root, clock=clock)
+    assert_consistent(r)
+    # 关键：新快照仍有效，内容可读，绝不悬空。
+    assert r.exists(oid)
+    assert r.get(oid) == data
+    assert r.get_snapshot(new_sid[0]).object_ids == [oid]
+
+    # 再次执行旧回收任务：旧实现这里抛 InternalConsistencyError；现在必须幂等。
+    again = r.gc_sweep(mark.run_id)
+    assert again.reclaimed == [oid]
+    assert r.exists(oid) and r.get(oid) == data
+    assert_consistent(r)
+
+    # 新一轮回收：对象被快照引用，必须保住。
+    nxt = r.gc()
+    assert nxt.reclaimed == []
+    assert r.exists(oid) and r.get(oid) == data
+    assert_consistent(r)
+
+
+def test_reborn_without_root_is_collected_by_next_run(repo_root, clock):
+    """窗口内复活但未挂任何根：旧回收清旧化身，复活对象由下一轮回收处理。"""
+
+    r_seed = Repository(repo_root, clock=clock)
+    data = b"reborn-no-root"
+    oid = r_seed.put(data)
+
+    barrier = threading.Barrier(2)
+    resurrect_done = threading.Event()
+
+    def on_before_unlink(run_id, object_id, blob_name):
+        barrier.wait(timeout=10)
+        resurrect_done.wait(timeout=10)
+
+    hooks = ScriptedHooks(on_before_unlink=on_before_unlink)
+    r_gc = Repository(repo_root, clock=clock, hooks=hooks)
+    mark = r_gc.gc_mark()
+
+    def resurrect() -> None:
+        barrier.wait(timeout=10)
+        Repository(repo_root, clock=clock).put(data)  # 复活但不发布
+        resurrect_done.set()
+
+    t = threading.Thread(target=resurrect)
+    t.start()
+    r_gc.gc_sweep(mark.run_id)
+    t.join(timeout=10)
+    assert not t.is_alive()
+
+    r = Repository(repo_root, clock=clock)
+    assert_consistent(r)
+    assert r.exists(oid)  # 复活的新化身行不被旧 run 删除
+    nxt = r.gc()
+    assert nxt.reclaimed == [oid]
+    assert not r.exists(oid)
+    assert_consistent(r)
+
+
 def test_concurrent_publish_between_phases_with_barrier(repo_root, clock):
     """在 sweep_begin 阶段屏障处并发发布：发布先于任何复核完成，对象被救回。"""
 
