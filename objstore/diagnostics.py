@@ -47,7 +47,9 @@ def check_consistency(repo: Repository) -> ConsistencyReport:
                 violations.append(f"{table} 引用了不存在的对象: {r[0]}")
 
         # 回收审计行：reclaimed 的对象必须真的不再有数据库行
-        # （数据库绝不能指向已删除文件）。
+        # （数据库绝不能指向已删除文件）。同一内容被重新写入而复活时，
+        # put 会在插入对象行的同一事务里把 reclaimed 候选改判为 rescued，
+        # 因此任何已提交状态出现本组合都意味着真正的不变量破坏。
         rows = conn.execute(
             "SELECT object_id FROM gc_candidates WHERE state = 'reclaimed'"
             " AND object_id IN (SELECT id FROM objects)"

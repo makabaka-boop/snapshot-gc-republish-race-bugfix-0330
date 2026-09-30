@@ -231,6 +231,102 @@ def test_sweep_is_idempotent_and_repeat_gc_runs_are_stable(repo, clock):
     assert_consistent(repo)
 
 
+def test_reput_and_publish_inside_delete_window_rescues_object(repo_root, clock):
+    """核心竞争：元数据删除已提交、文件未删的窗口内重写同一内容并发布。
+
+    重新发布必须成功，且旧回收不得再删除该文件：put 在插入对象行的同一
+    事务里把 reclaimed 候选改判 rescued，旧 run 的文件删除阶段在写锁内
+    复核到复活后放弃 unlink。旧 run 重试也不再报一致性错误。
+    """
+
+    r_main = Repository(repo_root, clock=clock)
+    oid = r_main.put(b"resurrect-me")
+
+    window_open = threading.Event()
+    resume = threading.Event()
+
+    def on_reclaim_committed(run_id, object_id):
+        # 删除窗口：对象行已删、文件仍在。阻塞到客户端完成重写+发布。
+        window_open.set()
+        assert resume.wait(timeout=10)
+
+    hooks = ScriptedHooks(on_reclaim_committed=on_reclaim_committed)
+    r_gc = Repository(repo_root, clock=clock, hooks=hooks)
+    mark = r_gc.gc_mark()
+    assert mark.candidate_ids == [oid]
+
+    result_box: dict = {}
+
+    def sweep() -> None:
+        result_box["result"] = r_gc.gc_sweep(mark.run_id)
+
+    t = threading.Thread(target=sweep)
+    t.start()
+    assert window_open.wait(timeout=10)
+
+    # 窗口内：同一内容重新写入（文件还在，put 直接沿用）并立即发布。
+    r_client = Repository(repo_root, clock=clock)
+    assert r_client.put(b"resurrect-me") == oid
+    sid = r_client.publish_snapshot([oid])
+
+    resume.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+
+    result = result_box["result"]
+    assert result.reclaimed == []
+    assert result.rescued == [oid]
+    assert r_main.get(oid) == b"resurrect-me"
+    assert r_main.get_snapshot(sid).object_ids == [oid]
+    assert_consistent(r_main)
+
+    # 旧 run 幂等重试：复活是合法结果，不报一致性错误。
+    again = r_gc.gc_sweep(mark.run_id)
+    assert again.reclaimed == []
+    assert again.rescued == [oid]
+    assert_consistent(r_main)
+
+
+def test_reput_after_completed_reclaim_is_legal_resurrection(repo, clock):
+    """回收彻底完成后重写同一内容：合法复活，一致性核对与旧 run 重试都不报错。"""
+
+    oid = repo.put(b"comeback")
+    result = repo.gc()
+    assert result.reclaimed == [oid]
+    assert not repo.exists(oid)
+
+    assert repo.put(b"comeback") == oid
+    assert repo.get(oid) == b"comeback"
+    assert_consistent(repo)  # 不得报 “reclaimed 候选仍有对象行”
+
+    retry = repo.gc_sweep(result.run_id)
+    assert retry.reclaimed == []
+    assert retry.rescued == [oid]
+    assert_consistent(repo)
+
+    # 复活对象被新快照引用后，下一轮回收同样不会动它。
+    sid = repo.publish_snapshot([oid])
+    assert repo.gc().reclaimed == []
+    assert repo.get_snapshot(sid).object_ids == [oid]
+    assert_consistent(repo)
+
+
+def test_resurrected_but_still_unreferenced_is_reclaimed_by_next_run(repo, clock):
+    """复活后仍无根引用：下一轮回收正常删除（复活不等于永久保活）。"""
+
+    oid = repo.put(b"ephemeral")
+    first = repo.gc()
+    assert first.reclaimed == [oid]
+
+    assert repo.put(b"ephemeral") == oid  # 复活但无引用
+    assert_consistent(repo)
+
+    second = repo.gc()
+    assert second.reclaimed == [oid]
+    assert not repo.exists(oid)
+    assert_consistent(repo)
+
+
 def test_unknown_and_duplicate_run_ids(repo, clock):
     with pytest.raises(UnknownGCRunError):
         repo.gc_sweep("deadbeef")

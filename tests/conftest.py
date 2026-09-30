@@ -59,6 +59,7 @@ class ScriptedHooks(NullHooks):
         on_mark_end=None,
         on_sweep_begin=None,
         on_before_reclaim=None,
+        on_reclaim_committed=None,
         on_after_reclaim=None,
     ) -> None:
         self._cbs = {
@@ -67,6 +68,7 @@ class ScriptedHooks(NullHooks):
             "mark_end": on_mark_end,
             "sweep_begin": on_sweep_begin,
             "before_reclaim": on_before_reclaim,
+            "reclaim_committed": on_reclaim_committed,
             "after_reclaim": on_after_reclaim,
         }
         self._lock = threading.Lock()
@@ -105,6 +107,9 @@ class ScriptedHooks(NullHooks):
 
     def before_reclaim(self, run_id: str, object_id: str) -> None:
         self._fire("before_reclaim", run_id, object_id)
+
+    def reclaim_committed(self, run_id: str, object_id: str) -> None:
+        self._fire("reclaim_committed", run_id, object_id)
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
         self._fire("after_reclaim", run_id, object_id)

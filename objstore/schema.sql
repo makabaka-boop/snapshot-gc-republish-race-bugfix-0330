@@ -61,3 +61,6 @@ CREATE TABLE IF NOT EXISTS gc_candidates (
     reclaimed_at INTEGER,
     PRIMARY KEY (run_id, object_id)
 ) WITHOUT ROWID;
+
+-- put 复活对象时按 object_id 改判历史 reclaimed 候选。
+CREATE INDEX IF NOT EXISTS idx_gc_candidates_object ON gc_candidates(object_id);

@@ -10,14 +10,21 @@
 
 * ``gc_mark``：在单个事务里计算存活集（快照 ∪ 未到期租约），把其余对象
   作为候选写入 ``gc_candidates``，不删除任何文件。
-* ``gc_sweep``：对每个候选在一个 **IMMEDIATE 写事务** 里重新复核。复核通过后，
-  **先在该事务中删除元数据（objects 行、候选标记为 reclaimed）并提交，随后才
-  删除文件**。这样崩溃只会留下“数据库不再引用、但文件尚未删除”的待清理文件
-  （由 gc_candidates 记录、重试时补删），绝不会出现“数据库指向已删除文件”，
-  也绝不会删掉数据库仍引用的文件。
+* ``gc_sweep``：对每个候选先在一个 **IMMEDIATE 写事务** 里重新复核。复核通过后，
+  **先在该事务中删除元数据（objects 行、候选标记为 reclaimed）并提交**；
+  文件删除随后在**另一个 IMMEDIATE 写事务**里带围栏执行：删前重新确认
+  “候选仍为 reclaimed 且对象行未复活”，成立才 unlink。这样崩溃只会留下
+  “数据库不再引用、但文件尚未删除”的待清理文件（由 gc_candidates 记录、
+  重试时补删），绝不会出现“数据库指向已删除文件”，也绝不会删掉数据库
+  仍引用的文件。
 
 两阶段之间（或扫描其他候选时）获得新引用的候选转为 ``rescued``；
 在删除窗口并发到达的发布会因行已不可见而确定性地收到对象不存在错误。
+
+**复活语义**：内容寻址下，同一内容在回收后（包括“元数据已删、文件未删”
+的窗口内）被重新写入是合法的——``put`` 会在插入对象行的同一事务里把该
+对象历史遗留的 reclaimed 候选改判为 ``rescued``，使旧回收运行放弃删除
+新化身的文件；旧运行的幂等重试因此看到确定的结果，而不是一致性错误。
 """
 
 from __future__ import annotations
@@ -217,7 +224,13 @@ class Repository:
     # ------------------------------------------------------------- 对象操作
 
     def put(self, data: bytes) -> str:
-        """写入一个对象，返回其内容 id（SHA-256）。重复写入是幂等的。"""
+        """写入一个对象，返回其内容 id（SHA-256）。重复写入是幂等的。
+
+        若该内容此前被回收（对象行已删），本次写入是一次合法复活：
+        插入新对象行的同一事务里，会把历史回收运行遗留的 reclaimed 候选
+        改判为 rescued——任何已提交状态都不允许“对象行存在 + reclaimed
+        审计指向它”的组合，旧运行因此不会再删除新化身的文件。
+        """
 
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data 必须是 bytes")
@@ -240,6 +253,12 @@ class Repository:
                 conn.execute(
                     "INSERT INTO objects(id, size, created_at) VALUES (?, ?, ?)",
                     (object_id, len(data), now),
+                )
+                # 复活：历史 run 的 reclaimed 审计不得再授权删除新化身的文件。
+                conn.execute(
+                    "UPDATE gc_candidates SET state = 'rescued'"
+                    " WHERE object_id = ? AND state = 'reclaimed'",
+                    (object_id,),
                 )
         return object_id
 
@@ -506,8 +525,10 @@ class Repository:
         有效（租约可以在窗口内到期，但这属于下一次回收的处理范围），从而保证
         回收绝不会删除“标记时仍被根引用”的对象。快照引用没有时间限制，始终保活。
 
-        每个候选在独立的 IMMEDIATE 写事务中完成复核与元数据删除。
-        两阶段之间获得新快照/租约引用的候选转为 ``rescued``。
+        每个候选在独立的 IMMEDIATE 写事务中完成复核与元数据删除，文件删除
+        在随后的独立写事务中带围栏复核后执行。
+        两阶段之间获得新快照/租约引用、或同一内容被重新写入（复活）的候选
+        转为 ``rescued``——复活是合法结果而非一致性错误。
         进程中断后重复调用本方法是安全的幂等重试。
         """
 
@@ -568,16 +589,16 @@ class Repository:
     def _sweep_one(self, run_id: str, object_id: str, mark_time: int) -> None:
         """复核并处理一个候选。安全重试：任何中途崩溃都可重入。
 
-        提交状态下删除顺序严格为「先删元数据并提交，再删文件」：
+        分两个事务，删除顺序严格为「先提交元数据删除，再删文件」：
 
-        * 崩溃在提交之前：事务整体回滚，文件、行、候选都保持原状，重试即可；
-        * 崩溃在提交之后、删文件之前：行与引用已不存在，只剩一个由 reclaimed
-          候选记录跟踪的待清理文件，重试时补删，任何 API 都无法再引用它。
+        * 事务一：复核通过后删除 objects 行、候选落 reclaimed 并提交。
+          崩溃在提交之前：事务整体回滚，文件、行、候选都保持原状，重试即可。
+        * 事务二（``_delete_reclaimed_file``）：带围栏的文件删除。崩溃在
+          两事务之间：只剩一个由 reclaimed 候选跟踪的待清理文件，重试时补删，
+          任何 API 都无法再引用它（除非同一内容被重新写入而合法复活）。
         """
 
         reclaimed_at = self._now()
-        pending_file = False
-        fire_after_hook = False
         with self._tx() as conn:
             candidate = conn.execute(
                 "SELECT state FROM gc_candidates WHERE run_id = ? AND object_id = ?",
@@ -585,31 +606,20 @@ class Repository:
             ).fetchone()
             if candidate is None:
                 return
-            if candidate["state"] == "reclaimed":
-                # 上一轮元数据已提交、文件可能还没删（或已删）。
-                row_exists = conn.execute(
-                    "SELECT 1 FROM objects WHERE id = ?", (object_id,)
-                ).fetchone()
-                if row_exists is not None:
-                    # 正常路径不可能出现：reclaimed 的对象行不应存在。
-                    raise InternalConsistencyError(
-                        f"reclaimed 候选仍有对象行: {object_id}"
-                    )
-                pending_file = self._path_for(object_id).exists()
-                fire_after_hook = pending_file  # 重试补删完成后视为一次回收完成
-            elif candidate["state"] == "candidate":
+            state = candidate["state"]
+            if state == "rescued":
+                return  # 已被救回/复活：本 run 不再触碰该对象。
+            if state == "candidate":
                 obj_row = conn.execute(
                     "SELECT 1 FROM objects WHERE id = ?", (object_id,)
                 ).fetchone()
                 if obj_row is None:
-                    # 行已不在：直接落审计状态，文件若存在则在事务外补删。
+                    # 行已不在：直接落审计状态，文件若存在则由事务二补删。
                     conn.execute(
                         "UPDATE gc_candidates SET state = 'reclaimed',"
                         " reclaimed_at = ? WHERE run_id = ? AND object_id = ?",
                         (reclaimed_at, run_id, object_id),
                     )
-                    pending_file = self._path_for(object_id).exists()
-                    fire_after_hook = True
                 elif self._is_live(conn, object_id, mark_time):
                     # 被快照引用（始终保活），或被在标记时刻仍未到期的租约引用，
                     # 又或两阶段之间/本次扫描期间获得的新根引用：一律救回。
@@ -618,6 +628,7 @@ class Repository:
                         " AND object_id = ?",
                         (run_id, object_id),
                     )
+                    return
                 else:
                     # 复核通过：钩子在写锁持有期间触发，因此并发发布会阻塞到
                     # 「行删除 + reclaimed 落库」提交完成；提交后该对象对任何
@@ -630,17 +641,47 @@ class Repository:
                         " reclaimed_at = ? WHERE run_id = ? AND object_id = ?",
                         (reclaimed_at, run_id, object_id),
                     )
-                    pending_file = self._path_for(object_id).exists()
-                    fire_after_hook = True
-            # rescued 候选：什么都不做。
+            # state == "reclaimed"：上轮已提交元数据删除，直接进入文件删除。
 
-        # 事务已提交（或候选已被救回）；现在才删除不再被任何元数据引用的文件。
-        # 崩溃在这里只会留下待清理文件，重试本方法时按 reclaimed 分支补删。
-        if pending_file:
-            path = self._path_for(object_id)
+        # 元数据删除已提交、文件尚未删除：这是崩溃与复活竞争的窗口。
+        self.hooks.reclaim_committed(run_id, object_id)
+        self._delete_reclaimed_file(run_id, object_id)
+
+    def _delete_reclaimed_file(self, run_id: str, object_id: str) -> None:
+        """带围栏的文件删除：持有写锁复核“仍为 reclaimed 且对象未复活”后才 unlink。
+
+        与 put/发布共用同一把 IMMEDIATE 写锁，因此两种交错都安全：
+
+        * put 先提交（对象复活、候选已改判 rescued）：这里看到 rescued 或
+          对象行，放弃删除——旧 run 绝不会删掉新化身的文件；
+        * 本事务先 unlink：随后的 put 会看到文件缺失并重写内容。
+        """
+
+        deleted = False
+        with self._tx() as conn:
+            candidate = conn.execute(
+                "SELECT state FROM gc_candidates WHERE run_id = ? AND object_id = ?",
+                (run_id, object_id),
+            ).fetchone()
+            if candidate is None or candidate["state"] != "reclaimed":
+                return  # 两事务之间被复活/改判：放弃删除。
+            row_exists = conn.execute(
+                "SELECT 1 FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if row_exists is not None:
+                # 防御：对象行已复活（正常路径下 put 已把候选改判 rescued，
+                # 这里兜底再判一次），绝不删除仍被引用的文件。
+                conn.execute(
+                    "UPDATE gc_candidates SET state = 'rescued'"
+                    " WHERE run_id = ? AND object_id = ?",
+                    (run_id, object_id),
+                )
+                return
+            # 此刻持有写锁：没有任何事务能并发地重建对象行或发布引用。
             with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-        if fire_after_hook:
+                self._path_for(object_id).unlink()
+            deleted = True
+        if deleted:
             self.hooks.after_reclaim(run_id, object_id)
 
     # --------------------------------------------------------------- 内部查询

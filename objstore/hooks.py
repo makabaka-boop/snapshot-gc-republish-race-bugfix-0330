@@ -25,7 +25,10 @@ class GCHooks(Protocol):
         """复核阶段开始。此处阻塞即可让并发线程在两阶段之间发布快照/续约。"""
 
     def before_reclaim(self, run_id: str, object_id: str) -> None:
-        """某个候选的复核已通过、删除事务已提交，文件删除前一刻调用。"""
+        """某个候选复核通过、删除事务持有写锁、对象行删除前一刻调用。"""
+
+    def reclaim_committed(self, run_id: str, object_id: str) -> None:
+        """元数据删除已提交、对象文件删除前一刻调用（崩溃/复活竞争窗口）。"""
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
         """候选文件与元数据都已删除后调用。"""
@@ -47,6 +50,9 @@ class NullHooks:
         pass
 
     def before_reclaim(self, run_id: str, object_id: str) -> None:
+        pass
+
+    def reclaim_committed(self, run_id: str, object_id: str) -> None:
         pass
 
     def after_reclaim(self, run_id: str, object_id: str) -> None:
